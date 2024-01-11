@@ -1,0 +1,220 @@
+//
+// To run only this test suite use:
+// make test TEST_PATH="stark_verifier/test_composer.cairo"
+// 
+
+%lang starknet
+
+from starkware.cairo.common.alloc import alloc
+from starkware.cairo.common.memset import memset
+from starkware.cairo.common.cairo_builtins import HashBuiltin
+
+from stark_verifier.crypto.random import PublicCoin
+from stark_verifier.air.air_instance import AirInstance, DeepCompositionCoefficients, get_deep_composition_coefficients, TraceCoefficients
+from stark_verifier.air.table import Table
+from stark_verifier.composer import compose_constraint_evaluations, DeepComposer, combine_compositions, compose_trace_columns
+from stark_verifier.utils import Vec
+from stark_verifier.air.transitions.frame import EvaluationFrame
+
+@external
+func __setup__() {
+    %{ 
+        # Compile, run, and generate proof of a fibonnaci program
+        import os
+        os.system('make INTEGRATION_PROGRAM_NAME=fibonacci integration_proof')
+    %}
+    return ();
+}
+
+@external
+func test_get_deep_composition_coefficients{range_check_ptr, pedersen_ptr: HashBuiltin*}() {
+    alloc_locals;
+
+    // Initialize arguments
+    let (local coin_ptr: PublicCoin*) = alloc();
+    let (local coeffs_expected_ptr: DeepCompositionCoefficients*) = alloc();
+    let (local air_ptr: AirInstance*) = alloc();
+    local deep_coefficients_trace_len;
+    local deep_coefficients_constraints_len;
+    %{
+        from zerosync_hints import *
+        from src.stark_verifier.utils import write_into_memory
+        data = evaluation_data()
+        write_into_memory(ids.air_ptr, data['air'], segments)
+        write_into_memory(ids.coeffs_expected_ptr, data['deep_coefficients'], segments)
+        write_into_memory(ids.coin_ptr, data['deep_coefficients_coin'], segments)
+        ids.deep_coefficients_trace_len = int(data['deep_coefficients_trace_len'])
+        ids.deep_coefficients_constraints_len = int(data['deep_coefficients_constraints_len'])
+    %}
+    
+    let public_coin = PublicCoin(seed = [coin_ptr].seed, counter = [coin_ptr].counter);
+
+    with pedersen_ptr, public_coin {
+        let coeffs = get_deep_composition_coefficients([air_ptr]);
+    }
+
+    let coeffs_expected = [coeffs_expected_ptr];
+    %{
+        for i in range(ids.deep_coefficients_trace_len):
+            addrA = ids.coeffs_expected.trace.address_ + i * ids.TraceCoefficients.SIZE
+            ptrA = memory[addrA + 1]
+            addrB = ids.coeffs.trace.address_ + i * ids.TraceCoefficients.SIZE
+            ptrB = memory[addrB + 1]
+            assert memory[addrA] == memory[addrB]
+            for j in range(memory[addrA]):
+                elemA = memory[ptrA + j]
+                elemB = memory[ptrB + j]
+                assert elemA == elemB, f"at index {i}, {j}: {hex(elemA)} != {hex(elemB)}"
+
+        for i in range(ids.deep_coefficients_constraints_len):
+            elemA = memory[ids.coeffs_expected.constraints + i]
+            elemB = memory[ids.coeffs.constraints + i]
+            assert elemA == elemB, f"at index {i}: {hex(elemA)} != {hex(elemB)}"
+    %}
+
+
+    let _lambda = coeffs.degree_lambda;
+    let mu = coeffs.degree_mu;
+    let lambda_expected = coeffs_expected.degree_lambda;
+    let mu_expected = coeffs_expected.degree_mu;
+    %{
+        assert ids._lambda == ids.lambda_expected, f"{ids._lambda} != {ids.lambda_expected}"
+        assert ids.mu == ids.mu_expected, f"{ids.mu} != {ids.mu_expected}"
+    %}
+
+    return ();
+}
+
+
+
+@external
+func test_compose_constraint_evaluations{range_check_ptr}() {
+    alloc_locals;
+
+    let (local composer_ptr: DeepComposer*) = alloc();
+    let (local queried_evaluations_ptr: Table*) = alloc();
+    let (local ood_evaluations_ptr: felt*) = alloc();
+    local ood_evaluations_len;
+
+    %{
+        from zerosync_hints import *
+        from src.stark_verifier.utils import write_into_memory
+        data = evaluation_data()
+        write_into_memory(ids.composer_ptr, data['composer'], segments)
+        write_into_memory(ids.queried_evaluations_ptr, data['queried_constraint_evaluations'], segments)
+        
+        evaluations = data['ood_constraint_evaluations'].split(', ')[1:]
+        i = 0
+        for elemB in evaluations:
+            memory[ids.ood_evaluations_ptr + i] = int(elemB, 16)
+            i += 1
+        
+        ids.ood_evaluations_len = len(evaluations)
+    %}
+
+    let ood_evaluations = Vec(n_elements=ood_evaluations_len, elements=ood_evaluations_ptr);
+
+    let result = compose_constraint_evaluations([composer_ptr], [queried_evaluations_ptr], ood_evaluations);
+
+    %{
+        expected = data['c_composition'].split(', ')[1:]
+        i = 0
+        for elemB in expected:
+            elemA = memory[ids.result + i] 
+            assert int(elemB, 16) == elemA, f'index {i}: {hex(elemA)} != {elemB}'
+            i += 1
+    %}
+    return ();
+}
+
+
+
+
+@external
+func test_combine_compositions{
+    range_check_ptr
+}() {
+    alloc_locals;
+
+    
+    let (local c_composition: felt*) = alloc();
+    let (local t_composition: felt*) = alloc();
+    let (local composer_ptr: DeepComposer*) = alloc();
+
+    %{
+        from zerosync_hints import *
+        from src.stark_verifier.utils import write_into_memory
+        data = evaluation_data()
+        write_into_memory(ids.composer_ptr, data['composer'], segments)
+
+        c_composition = data['c_composition'].split(', ')[1:]
+        i = 0
+        for elemB in c_composition:
+            memory[ids.c_composition + i] = int(elemB, 16)
+            i += 1
+
+        t_composition = data['t_composition'].split(', ')[1:]
+        i = 0
+        for elemB in t_composition:
+            memory[ids.t_composition + i] = int(elemB, 16)
+            i += 1
+    %}
+
+    let result = combine_compositions([composer_ptr], t_composition, c_composition);
+
+    %{
+        expected = data['deep_evaluations'].split(', ')[1:]
+        i = 0
+        for elemB in expected:
+            elemA = memory[ids.result + i] 
+            assert int(elemB, 16) == elemA, f'index {i}: {hex(elemA)} != {elemB}'
+            i += 1
+    %}
+    return ();
+}
+
+
+
+@external
+func test_compose_trace_columns{
+    range_check_ptr
+}() {
+    alloc_locals;
+
+    let (local composer_ptr: DeepComposer*) = alloc();
+    let (local queried_main_trace_states: Table*) = alloc();
+    let (local queried_aux_trace_states: Table*) = alloc();
+    let (local ood_main_trace_frame: EvaluationFrame*) = alloc();
+    let (local ood_aux_trace_frame: EvaluationFrame*) = alloc();
+
+    %{
+        from zerosync_hints import *
+        from src.stark_verifier.utils import write_into_memory
+        data = evaluation_data()
+        write_into_memory(ids.composer_ptr, data['composer'], segments)
+        write_into_memory(ids.queried_main_trace_states, data['queried_main_trace_states'], segments)
+        write_into_memory(ids.queried_aux_trace_states, data['queried_aux_trace_states'], segments)
+        write_into_memory(ids.ood_main_trace_frame, data['ood_main_trace_frame'], segments)
+        write_into_memory(ids.ood_aux_trace_frame, data['ood_aux_trace_frame'], segments)
+    %}
+
+    let result = compose_trace_columns(
+        [composer_ptr], 
+        [queried_main_trace_states], 
+        [queried_aux_trace_states], 
+        [ood_main_trace_frame], 
+        [ood_aux_trace_frame], 
+    );
+
+    %{
+        expected = data['t_composition'].split(', ')[1:]
+        i = 0
+        for elemB in expected:
+            elemA = memory[ids.result + i] 
+            assert int(elemB, 16) == elemA, f'index {i}: {hex(elemA)} != {elemB}'
+            i += 1
+    %}
+    return ();
+}
+
+
